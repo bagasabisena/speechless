@@ -5,7 +5,7 @@ import editdistance
 import numpy
 from collections import OrderedDict
 from keras import backend
-from keras.callbacks import Callback, TensorBoard
+from keras.callbacks import Callback, TensorBoard, EarlyStopping
 from keras.engine import Input, Layer, Model
 from keras.layers import Lambda, Dropout, Conv1D
 from keras.models import Sequential
@@ -126,6 +126,7 @@ class Wav2Letter:
     def __init__(self,
                  input_size_per_time_step: int,
                  allowed_characters: List[chr],
+                 epoch: int,
                  use_raw_wave_input: bool = False,
                  activation: str = "relu",
                  output_activation: str = "softmax",
@@ -139,10 +140,14 @@ class Wav2Letter:
                  use_asg: bool = False,
                  asg_transition_probabilities: Optional[ndarray] = None,
                  asg_initial_probabilities: Optional[ndarray] = None,
-                 kenlm_directory: Path = None):
+                 kenlm_directory: Path = None,
+                 keep_checkpoint: int = 5,
+                 early_stop: bool = False,
+                 patience: int = 5):
 
         if frozen_layer_count > 0 and load_model_from_directory is None:
-            raise ValueError("Layers cannot be frozen if model is trained from scratch.")
+            raise ValueError(
+                "Layers cannot be frozen if model is trained from scratch.")
 
         self.kenlm_directory = kenlm_directory
         self.grapheme_encoding = AsgGraphemeEncoding(allowed_characters=allowed_characters) \
@@ -156,6 +161,7 @@ class Wav2Letter:
             self.grapheme_encoding.grapheme_set_size) \
             if asg_initial_probabilities is None else asg_initial_probabilities
 
+        self.epoch = epoch
         self.use_asg = use_asg
         self.frozen_layer_count = frozen_layer_count
         self.output_activation = output_activation
@@ -167,6 +173,9 @@ class Wav2Letter:
         self.dropout = dropout
         self.predictive_net = self.create_predictive_net()
         self.prediction_phase_flag = 0.
+        self.keep_checkpoint = keep_checkpoint
+        self.early_stop = early_stop
+        self.patience = patience
 
         if self.kenlm_directory is not None:
             expected_characters = list(
@@ -194,13 +203,15 @@ class Wav2Letter:
 
         extra = target_character_set - load_character_set
         if extra:
-            log("Initializing extra characters {} not found in model.".format(sorted(extra)))
+            log("Initializing extra characters {} not found in model.".format(
+                sorted(extra)))
 
         def character_index_to_load(target_character: chr) -> Optional[int]:
             return single_or_none([index for index, character in enumerate(allowed_characters_for_loaded_model) if
                                    character == target_character])
 
-        character_mapping = [character_index_to_load(character) for character in allowed_characters]
+        character_mapping = [character_index_to_load(
+            character) for character in allowed_characters]
 
         log("Character mapping: {}".format(character_mapping))
 
@@ -209,7 +220,8 @@ class Wav2Letter:
     def load_weights(self, allowed_characters_for_loaded_model: List[chr], load_epoch: int,
                      load_model_from_directory: Path, loaded_first_layers_count: Optional[int] = None):
         if allowed_characters_for_loaded_model is None:
-            self.predictive_net.load_weights(str(load_model_from_directory / self.model_file_name(load_epoch)))
+            self.predictive_net.load_weights(
+                str(load_model_from_directory / self.model_file_name(load_epoch)))
         else:
             layer_count = len(self.predictive_net.layers)
 
@@ -218,6 +230,7 @@ class Wav2Letter:
 
             original_wav2letter = Wav2Letter(input_size_per_time_step=self.input_size_per_time_step,
                                              allowed_characters=allowed_characters_for_loaded_model,
+                                             epoch=self.epoch,
                                              use_raw_wave_input=self.use_raw_wave_input,
                                              activation=self.activation,
                                              output_activation=self.output_activation,
@@ -228,14 +241,16 @@ class Wav2Letter:
                                              frozen_layer_count=self.frozen_layer_count,
                                              use_asg=self.use_asg,
                                              asg_initial_probabilities=self.asg_initial_probabilities,
-                                             asg_transition_probabilities=self.asg_transition_probabilities)
+                                             asg_transition_probabilities=self.asg_transition_probabilities,
+                                             keep_checkpoint=5)
 
             log("Loading first {} layers of {}, epoch {}, reinitializing the last {}.".format(
                 loaded_first_layers_count, load_model_from_directory, load_epoch,
                 layer_count - loaded_first_layers_count))
 
             for index, layer in enumerate(self.predictive_net.layers[:loaded_first_layers_count]):
-                original_weights, original_biases = original_wav2letter.predictive_net.layers[index].get_weights()
+                original_weights, original_biases = original_wav2letter.predictive_net.layers[index].get_weights(
+                )
 
                 if index == len(self.predictive_net.layers) - 1:
                     indices_to_load_by_target_index = self.indices_to_load_by_target_index(
@@ -264,7 +279,8 @@ class Wav2Letter:
                     original_weights = numpy.concatenate(
                         [loaded_character_weights(index) for index in grapheme_indices_to_load], axis=2)
 
-                    original_biases = numpy.array([loaded_character_bias(index) for index in grapheme_indices_to_load])
+                    original_biases = numpy.array(
+                        [loaded_character_bias(index) for index in grapheme_indices_to_load])
 
                 layer.set_weights([original_weights, original_biases])
 
@@ -276,15 +292,18 @@ class Wav2Letter:
         asg_transition_probabilities[0] = zero_array
         asg_transition_probabilities[:, 0] = zero_array
         # sum up each column, add dummy 1 in front for easier division later
-        transition_norms = concatenate(([1], asg_transition_probabilities[:, 1:].sum(axis=0)))
+        transition_norms = concatenate(
+            ([1], asg_transition_probabilities[:, 1:].sum(axis=0)))
         asg_transition_probabilities = asg_transition_probabilities / transition_norms
         return asg_transition_probabilities
 
     @staticmethod
     def _default_asg_initial_probabilities(grapheme_set_size: int) -> ndarray:
-        asg_initial_probabilities = random.randint(1, 15, grapheme_set_size + 1)
+        asg_initial_probabilities = random.randint(
+            1, 15, grapheme_set_size + 1)
         asg_initial_probabilities[0] = 0
-        asg_initial_probabilities = asg_initial_probabilities / asg_initial_probabilities.sum()
+        asg_initial_probabilities = asg_initial_probabilities / \
+            asg_initial_probabilities.sum()
         # N.B. beware that initial_logprobs[0] is now -inf, NOT 0!
         return asg_initial_probabilities
 
@@ -301,8 +320,8 @@ class Wav2Letter:
             return ([] if self.dropout is None or never_dropout else [
                 Dropout(self.dropout, input_shape=(None, input_dim),
                         name="dropout_before_{}".format(name))]) + [
-                       Conv1D(filters=filter_count, kernel_size=filter_length, strides=strides,
-                              activation=activation, name=name, input_shape=(None, input_dim), padding="same")]
+                Conv1D(filters=filter_count, kernel_size=filter_length, strides=strides,
+                       activation=activation, name=name, input_shape=(None, input_dim), padding="same")]
 
         main_filter_count = 250
 
@@ -323,8 +342,10 @@ class Wav2Letter:
         def output_convolutions() -> List[Conv1D]:
             out_filter_count = 2000
             return [layer for conv in [
-                convolution("big_conv_1", filter_count=out_filter_count, filter_length=32, never_dropout=True),
-                convolution("big_conv_2", filter_count=out_filter_count, filter_length=1, never_dropout=True),
+                convolution("big_conv_1", filter_count=out_filter_count,
+                            filter_length=32, never_dropout=True),
+                convolution("big_conv_2", filter_count=out_filter_count,
+                            filter_length=1, never_dropout=True),
                 convolution("output_conv", filter_count=self.grapheme_encoding.grapheme_set_size,
                             filter_length=1,
                             activation=self.output_activation, never_dropout=True)
@@ -333,7 +354,8 @@ class Wav2Letter:
         layers = input_convolutions() + inner_convolutions() + output_convolutions()
 
         if self.frozen_layer_count > 0:
-            log("All but {} layers frozen.".format(len(layers) - self.frozen_layer_count))
+            log("All but {} layers frozen.".format(
+                len(layers) - self.frozen_layer_count))
 
         for layer in layers[:self.frozen_layer_count]:
             layer.trainable = False
@@ -360,8 +382,10 @@ class Wav2Letter:
     def loss_net(self) -> Model:
         """Returns the network that yields a loss given both input spectrograms and labels. Used for training."""
         input_batch = self._input_batch_input
-        label_batch = Input(name=Wav2Letter.InputNames.label_batch, shape=(None,), dtype='int32')
-        label_lengths = Input(name=Wav2Letter.InputNames.label_lengths, shape=(1,), dtype='int64')
+        label_batch = Input(
+            name=Wav2Letter.InputNames.label_batch, shape=(None,), dtype='int32')
+        label_lengths = Input(
+            name=Wav2Letter.InputNames.label_lengths, shape=(1,), dtype='int64')
 
         asg_transition_probabilities_variable = backend.variable(value=self.asg_transition_probabilities,
                                                                  name="asg_transition_probabilities")
@@ -386,7 +410,8 @@ class Wav2Letter:
                          outputs=[loss])
         # Since loss is already calculated in the last layer of the net, we just pass through the results here.
         # The loss dummy labels have to be given to satify the Keras API.
-        loss_net.compile(loss=lambda dummy_labels, ctc_loss: ctc_loss, optimizer=self.optimizer)
+        loss_net.compile(loss=lambda dummy_labels,
+                         ctc_loss: ctc_loss, optimizer=self.optimizer)
         return loss_net
 
     @lazy
@@ -410,7 +435,8 @@ class Wav2Letter:
         decoding_layer = Lambda(self._decode_lambda, name='ctc_decode')
 
         prediction_batch = self.predictive_net(self._input_batch_input)
-        decoded = decoding_layer([prediction_batch, self._prediction_lengths_input])
+        decoded = decoding_layer(
+            [prediction_batch, self._prediction_lengths_input])
 
         return Model(inputs=[self._input_batch_input, self._prediction_lengths_input], outputs=[decoded])
 
@@ -427,8 +453,10 @@ class Wav2Letter:
 
         prediction_batch, prediction_lengths = args
 
-        log_prediction_batch = tf.log(tf.transpose(prediction_batch, perm=[1, 0, 2]) + 1e-8)
-        prediction_length_batch = tf.to_int32(tf.squeeze(prediction_lengths, axis=[1]))
+        log_prediction_batch = tf.log(tf.transpose(
+            prediction_batch, perm=[1, 0, 2]) + 1e-8)
+        prediction_length_batch = tf.to_int32(
+            tf.squeeze(prediction_lengths, axis=[1]))
 
         (decoded, log_prob) = self.ctc_get_decoded_and_log_probability_batch(log_prediction_batch,
                                                                              prediction_length_batch)
@@ -445,7 +473,8 @@ class Wav2Letter:
             return tf.nn.ctc_beam_search_decoder(inputs=log_prediction_batch,
                                                  sequence_length=prediction_length_batch,
                                                  merge_repeated=False,
-                                                 kenlm_directory_path=str(self.kenlm_directory),
+                                                 kenlm_directory_path=str(
+                                                     self.kenlm_directory),
                                                  kenlm_weight=.8,
                                                  word_count_weight=0,
                                                  valid_word_count_weight=2.3)
@@ -459,15 +488,18 @@ class Wav2Letter:
                                 [single(self.decoding_net.outputs), single(self.loss_net.outputs)])
 
     def test_and_predict_batch(self, labeled_spectrogram_batch: List[LabeledSpectrogram]) -> ExpectationsVsPredictions:
-        input_by_name, dummy_labels = self._inputs_for_loss_net(labeled_spectrogram_batch)
+        input_by_name, dummy_labels = self._inputs_for_loss_net(
+            labeled_spectrogram_batch)
 
         predicted_graphemes, loss_batch = self.get_predicted_graphemes_and_loss_batch(
             [input_by_name[input.name.split(":")[0]] for input in self.loss_net.inputs] + [self.prediction_phase_flag])
 
         # blank labels are returned as -1 by tensorflow:
-        predicted_graphemes[predicted_graphemes < 0] = self.grapheme_encoding.ctc_blank
+        predicted_graphemes[predicted_graphemes <
+                            0] = self.grapheme_encoding.ctc_blank
 
-        prediction_lengths = list(numpy.squeeze(input_by_name[Wav2Letter.InputNames.prediction_lengths], axis=1))
+        prediction_lengths = list(numpy.squeeze(
+            input_by_name[Wav2Letter.InputNames.prediction_lengths], axis=1))
         losses = list(numpy.squeeze(loss_batch, axis=1))
 
         # merge was already done by tensorflow, so we disable it here:
@@ -483,7 +515,8 @@ class Wav2Letter:
         return Input(name=Wav2Letter.InputNames.input_batch, batch_shape=self.predictive_net.input_shape)
 
     def predict_batch_greedily(self, spectrograms: List[ndarray]) -> List[str]:
-        input_batch, prediction_lengths = self._input_batch_and_prediction_lengths(spectrograms)
+        input_batch, prediction_lengths = self._input_batch_and_prediction_lengths(
+            spectrograms)
 
         return self.grapheme_encoding.decode_prediction_batch(self.prediction_batch(input_batch),
                                                               prediction_lengths=prediction_lengths)
@@ -498,12 +531,12 @@ class Wav2Letter:
         return self.test_and_predict(labeled_spectrogram).predicted
 
     def _loss_inputs_generator(self, labeled_spectrogram_batches: Iterable[List[LabeledSpectrogram]]) -> Iterable[
-        Tuple[Dict, ndarray]]:
+            Tuple[Dict, ndarray]]:
         for labeled_spectrogram_batch in labeled_spectrogram_batches:
             yield self._inputs_for_loss_net(labeled_spectrogram_batch)
 
     def _inputs_for_loss_net(self, labeled_spectrogram_batch: List[LabeledSpectrogram]) -> Tuple[
-        Dict[str, ndarray], ndarray]:
+            Dict[str, ndarray], ndarray]:
         batch_size = len(labeled_spectrogram_batch)
         dummy_labels_for_dummy_loss_function = zeros((batch_size,))
         training_input_dictionary = self._input_dictionary_for_loss_net(
@@ -519,7 +552,7 @@ class Wav2Letter:
         return result
 
     def test_and_predict_batches(self, labeled_spectrogram_batches: Iterable[
-        List[LabeledSpectrogram]]) -> ExpectationsVsPredictionsInBatches:
+            List[LabeledSpectrogram]]) -> ExpectationsVsPredictionsInBatches:
         return ExpectationsVsPredictionsInBatches([self.test_and_predict_batch_with_log(index, batch)
                                                    for index, batch in enumerate(labeled_spectrogram_batches)])
 
@@ -532,7 +565,7 @@ class Wav2Letter:
         return result
 
     def test_and_predict_grouped_batches(self, grouped_labeled_spectrogram_batches: Dict[str, Iterable[
-        List[LabeledSpectrogram]]]) -> ExpectationsVsPredictionsInGroupedBatches:
+            List[LabeledSpectrogram]]]) -> ExpectationsVsPredictionsInGroupedBatches:
         return ExpectationsVsPredictionsInGroupedBatches(
             OrderedDict((corpus_name, self.test_and_predict_batches_with_log(corpus_name=corpus_name,
                                                                              batches=labeled_spectrogram_batches))
@@ -544,10 +577,11 @@ class Wav2Letter:
               tensor_board_log_directory: Path,
               net_directory: Path,
               batches_per_epoch: int):
-        print_preview_batch = lambda: log(self.test_and_predict_batch(preview_labeled_spectrogram_batch))
+        def print_preview_batch(): return log(
+            self.test_and_predict_batch(preview_labeled_spectrogram_batch))
 
         print_preview_batch()
-        self.loss_net.fit_generator(self._loss_inputs_generator(labeled_spectrogram_batches), epochs=100000000,
+        self.loss_net.fit_generator(self._loss_inputs_generator(labeled_spectrogram_batches), epochs=self.epoch,
                                     steps_per_epoch=batches_per_epoch,
                                     callbacks=self.create_callbacks(
                                         callback=print_preview_batch,
@@ -569,20 +603,32 @@ class Wav2Letter:
                 if epoch % save_step == 0 and epoch > 0:
                     mkdir(net_directory)
 
-                    self.predictive_net.save_weights(str(net_directory / self.model_file_name(epoch)))
+                    self.predictive_net.save_weights(
+                        str(net_directory / self.model_file_name(epoch)))
+
+                    # delete weights so we save only
+                    # keep_checkpoint number of weights
+                    if epoch > self.keep_checkpoint:
+                        to_be_deleted = net_directory / self.model_file_name(epoch - self.keep_checkpoint)
+                        to_be_deleted.unlink()
 
         tensorboard_if_running_tensorflow = [TensorBoard(
             log_dir=str(tensor_board_log_directory), write_images=True)] if backend.backend() == 'tensorflow' else []
-        return tensorboard_if_running_tensorflow + [CustomCallback()]
+        
+        early_stopping = [EarlyStopping(patience=self.patience)] if self.early_stop else []
+        return tensorboard_if_running_tensorflow + [CustomCallback()] + early_stopping
 
     def _input_batch_and_prediction_lengths(self, spectrograms: List[ndarray]) -> Tuple[ndarray, List[int]]:
         batch_size = len(spectrograms)
         input_size_per_time_step = spectrograms[0].shape[1]
         input_lengths = [spectrogram.shape[0] for spectrogram in spectrograms]
-        prediction_lengths = [s // self.input_to_prediction_length_ratio for s in input_lengths]
-        input_batch = zeros((batch_size, max(input_lengths), input_size_per_time_step))
+        prediction_lengths = [
+            s // self.input_to_prediction_length_ratio for s in input_lengths]
+        input_batch = zeros(
+            (batch_size, max(input_lengths), input_size_per_time_step))
         for index, spectrogram in enumerate(spectrograms):
-            input_batch[index, :spectrogram.shape[0], :spectrogram.shape[1]] = spectrogram
+            input_batch[index, :spectrogram.shape[0],
+                        :spectrogram.shape[1]] = spectrogram
 
         return input_batch, prediction_lengths
 
@@ -590,13 +636,16 @@ class Wav2Letter:
         return reshape(array(prediction_lengths), (batch_size, 1))
 
     def _input_dictionary_for_loss_net(self, labeled_spectrogram_batch: List[LabeledSpectrogram]) -> Dict[str, ndarray]:
-        spectrograms = [x.z_normalized_transposed_spectrogram() for x in labeled_spectrogram_batch]
+        spectrograms = [x.z_normalized_transposed_spectrogram()
+                        for x in labeled_spectrogram_batch]
         labels = [x.label for x in labeled_spectrogram_batch]
-        input_batch, prediction_lengths = self._input_batch_and_prediction_lengths(spectrograms)
+        input_batch, prediction_lengths = self._input_batch_and_prediction_lengths(
+            spectrograms)
 
         # Sets learning phase to training to enable dropout (see backend.learning_phase documentation for more info):
         training_phase_flag_tensor = array([True])
-        label_lengths = reshape(array([len(label) for label in labels]), (len(labeled_spectrogram_batch), 1))
+        label_lengths = reshape(
+            array([len(label) for label in labels]), (len(labeled_spectrogram_batch), 1))
         return {
             Wav2Letter.InputNames.input_batch: input_batch,
             Wav2Letter.InputNames.prediction_lengths: self._prediction_length_batch(prediction_lengths,
