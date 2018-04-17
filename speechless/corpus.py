@@ -218,8 +218,15 @@ class LabeledSpectrogramBatchGenerator:
 
         self.labeled_spectrograms = self.labeled_training_spectrograms + self.labeled_test_spectrograms
 
-    def preview_batch(self) -> List[LabeledSpectrogram]:
-        return self.labeled_spectrograms[:self.batch_size]
+    def preview_batch(self, config='mix') -> List[LabeledSpectrogram]:
+        if config == 'mix':
+            return self.labeled_spectrograms[:self.batch_size]
+        elif config == 'train':
+            return self.labeled_training_spectrograms[:self.batch_size]
+        elif config == 'test':
+            return self.labeled_test_spectrograms[:self.batch_size]
+        else:
+            return self.labeled_spectrograms[:self.batch_size]
 
     def training_batches(self) -> Iterable[List[LabeledSpectrogram]]:
         while True:

@@ -97,7 +97,7 @@ class Configuration:
         wav2letter.train(self.batch_generator.training_batches(),
                          tensor_board_log_directory=self.directories.tensorboard_log_base_directory / run_name,
                          net_directory=self.directories.nets_base_directory / run_name,
-                         preview_labeled_spectrogram_batch=self.batch_generator.preview_batch(),
+                         preview_labeled_spectrogram_batch=self.batch_generator.preview_batch(config='test'),
                          batches_per_epoch=self.training_batches_per_epoch)
 
     def train_from_beginning(self):
