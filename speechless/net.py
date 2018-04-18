@@ -1,5 +1,6 @@
 from functools import reduce
 from pathlib import Path
+import json
 
 import editdistance
 import numpy
@@ -17,6 +18,7 @@ from typing import List, Callable, Iterable, Tuple, Dict, Optional
 from speechless.grapheme_enconding import CtcGraphemeEncoding, AsgGraphemeEncoding
 from speechless.labeled_example import LabeledSpectrogram
 from speechless.tools import average_or_nan, mkdir, single, read_text, log, single_or_none
+from speechless.corpus import Corpus, LabeledSpectrogramBatchGenerator
 
 
 class ExpectationVsPrediction:
@@ -127,6 +129,9 @@ class Wav2Letter:
                  input_size_per_time_step: int,
                  allowed_characters: List[chr],
                  epoch: int,
+                 corpus: Corpus,
+                 spectrogram_cache_directory: Path,
+                 batch_size: int,
                  use_raw_wave_input: bool = False,
                  activation: str = "relu",
                  output_activation: str = "softmax",
@@ -176,6 +181,9 @@ class Wav2Letter:
         self.keep_checkpoint = keep_checkpoint
         self.early_stop = early_stop
         self.patience = patience
+        self.corpus = corpus
+        self.spectrogram_cache_directory = spectrogram_cache_directory
+        self.batch_size = batch_size
 
         if self.kenlm_directory is not None:
             expected_characters = list(
@@ -230,6 +238,9 @@ class Wav2Letter:
 
             original_wav2letter = Wav2Letter(input_size_per_time_step=self.input_size_per_time_step,
                                              allowed_characters=allowed_characters_for_loaded_model,
+                                             corpus=self.corpus,
+                                             spectrogram_cache_directory=self.spectrogram_cache_directory,
+                                             batch_size=self.batch_size,
                                              epoch=self.epoch,
                                              use_raw_wave_input=self.use_raw_wave_input,
                                              activation=self.activation,
@@ -553,7 +564,7 @@ class Wav2Letter:
 
     def test_and_predict_batches(self, labeled_spectrogram_batches: Iterable[
             List[LabeledSpectrogram]]) -> ExpectationsVsPredictionsInBatches:
-        return ExpectationsVsPredictionsInBatches([self.test_and_predict_batch_with_log(index, batch)
+        return ExpectationsVsPredictionsInBatches([self.test_and_predict_batch(batch)
                                                    for index, batch in enumerate(labeled_spectrogram_batches)])
 
     def test_and_predict_batches_with_log(
@@ -580,11 +591,17 @@ class Wav2Letter:
         def print_preview_batch(): return log(
             self.test_and_predict_batch(preview_labeled_spectrogram_batch))
 
+        def print_val():
+            # log(self.test_and_predict_batches(labeled_spectrogram_batches))
+            # log(self.test_and_predict_batches(labeled_spectogram_batches_val))
+            pass
+
         print_preview_batch()
         self.loss_net.fit_generator(self._loss_inputs_generator(labeled_spectrogram_batches), epochs=self.epoch,
                                     steps_per_epoch=batches_per_epoch,
                                     callbacks=self.create_callbacks(
                                         callback=print_preview_batch,
+                                        callback_val=print_val,
                                         tensor_board_log_directory=tensor_board_log_directory,
                                         net_directory=net_directory),
                                     initial_epoch=self.load_epoch if (self.load_epoch is not None) else 0)
@@ -593,12 +610,37 @@ class Wav2Letter:
     def model_file_name(epoch: int) -> str:
         return "weights-epoch{}.h5".format(epoch)
 
-    def create_callbacks(self, callback: Callable[[], None], tensor_board_log_directory: Path, net_directory: Path,
+    def create_callbacks(self, callback: Callable[[], None],
+        callback_val: Callable[[], None],
+        tensor_board_log_directory: Path, net_directory: Path,
                          callback_step: int = 1, save_step: int = 1) -> List[Callback]:
         class CustomCallback(Callback):
             def on_epoch_end(self_callback, epoch, logs=()):
                 if epoch % callback_step == 0:
                     callback()
+                    
+                    # validation
+                    data_generator = LabeledSpectrogramBatchGenerator(self.corpus, self.spectrogram_cache_directory, self.batch_size)
+                    test_batches = data_generator.test_batches()
+                    result = self.test_and_predict_batches(test_batches)
+                    print('WER:', result.average_letter_error_rate)
+                    result_dict = {
+                        'wer': result.average_word_error_rate,
+                        'ler': result.average_letter_error_rate,
+                        'loss': result.average_loss,
+                        'epoch': epoch
+                    }
+
+                    def write_to_jsonl(result_dict, mode='w'):
+                        with output_path.open(mode) as f:
+                            f.write(json.dumps(result_dict))
+                            f.write('\n')
+
+                    output_path = tensor_board_log_directory / 'output_val.jsonl'
+                    if epoch == 0:
+                        write_to_jsonl(result_dict, 'w')
+                    else:
+                        write_to_jsonl(result_dict, 'a')
 
                 if epoch % save_step == 0 and epoch > 0:
                     mkdir(net_directory)
